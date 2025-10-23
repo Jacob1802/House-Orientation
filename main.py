@@ -1,25 +1,23 @@
 from shapely.geometry import LineString, Point
 from curl_cffi import requests
+import asyncio
 import math
+import sys
 
 MAX_RETRIES = 3
 
-def main():
+async def main():
     state = 'NSW'
     suburb = 'Picnic point'
     postcode = '2213'
+    max_properties = 1000
 
-    raw_data = fetch_properties(state, suburb, postcode)
-    if not raw_data:
+    property_data = await collect_properties(state, suburb, postcode, max_properties)
+    if not property_data:
         print("No data retrieved.")
         return
     
-    properties = raw_data.get('content', [])
-    if not properties:
-        print("No properties found.")
-        return
-    
-    for prop in properties:
+    for prop in property_data:
         address = prop.get('address', {})
         location = address.get('location', {})
         lat = location.get('lat')
@@ -33,6 +31,8 @@ def main():
             facing_direction = determine_house_facing_direction(lat, lon)
             print(f"Facing Direction: {facing_direction}")
             print('-'*50)
+        except KeyboardInterrupt:
+            sys.exit()
         except Exception as e:
             print(f"Error determining facing direction: {e}")
 
@@ -58,7 +58,7 @@ def determine_house_facing_direction(LAT, LON):
             print(f'Error fetching overpass data: {e}, retrying {retries}/{MAX_RETRIES}')
 
     if not data.get("elements"):
-        raise SystemExit("❌ No roads found within 20m of that location.")
+        raise Exception("❌ No roads found within 20m of that location.")
 
     pt = Point(LON, LAT)
     roads = []
@@ -74,6 +74,9 @@ def determine_house_facing_direction(LAT, LON):
                 "line": line,
                 "dist": dist
             })
+
+    if not roads:
+       raise Exception("No roads with valid geometry found")
 
     nearest_road = min(roads, key=lambda r: r["dist"])
 
@@ -123,7 +126,7 @@ def house_facing_direction(house_lat, house_lon, road_line):
     return bearing_to_compass(facing)
 
 
-def fetch_properties(stateCode, suburb, postCode):
+async def collect_properties(stateCode, suburb, postCode, max_properties):
     headers = {
         'accept': 'application/json, text/plain, */*',
         'accept-language': 'en-US,en;q=0.5',
@@ -162,21 +165,62 @@ def fetch_properties(stateCode, suburb, postCode):
             ],
         },
     }
+
+    tasks = []
+    url = 'https://www.onthehouse.com.au/odin/api/composite/search'
+
+    async with requests.AsyncSession(headers=headers, impersonate="chrome") as session:
+        data = await collect_initial(url, json=json_data, session=session)
+        if not data:
+            sys.exit('Error fetching data, exiting')
+        
+        clean_responses = data.get('content', [])
+        max_listings = min(data['totalElements'], max_properties)
+        max_pages = math.ceil(max_listings / 100)
+        for batch in range(1, max_pages):
+            temp_data = json_data.copy()
+            temp_data['number'] = batch
+
+            tasks.append(post_with_retries(url, json=temp_data, session=session))
+
+        responses = await asyncio.gather(*tasks, return_exceptions=True)
+
+    for page, response in zip(range(max_pages), responses):
+        if isinstance(response, Exception):
+            print(f"Page {page} failed with error {response}")
+            continue
+        
+        data = response.json()
+        content = data.get('content', [])
+        clean_responses.extend(content)
+    
+    return clean_responses
+        
+
+async def collect_initial(url, json, session):
+    response = await post_with_retries(url, json, session)
+    
+    if isinstance(response, Exception):
+        print(f"Initial page failed with error {response}")
+        return None
+    data = response.json()
+    return data
+
+async def post_with_retries(url, json, session):
     for retries in range(MAX_RETRIES):
         try:
-            response = requests.post(
-                'https://www.onthehouse.com.au/odin/api/composite/search',
-                headers=headers,
-                json=json_data,
-                impersonate="chrome",
+            response = await session.post(
+                url,
+                json=json,
             )
             response.raise_for_status()
-            return response.json()
+            return response
         except Exception as e:
+            await asyncio.sleep(1)
             print(f"Error fetching properties: {e}, retrying {retries}/{MAX_RETRIES}")
-            return []
+            return e
 
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())
 
